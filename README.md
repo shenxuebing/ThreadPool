@@ -47,9 +47,10 @@ std::cout << result.get() << std::endl;
 // enqueue and store future
 auto result = pool.enqueue([](int answer) { return answer; }, 42);
 
-// get result from future
-std::cout << result.get() << std::endl;
 
 // wait for all tasks to complete
 pool4.drain(); 
+
+// get result from future
+std::cout << result.get() << std::endl;
 ```
