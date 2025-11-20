@@ -11,6 +11,8 @@
 #include <functional>
 #include <stdexcept>
 #include <iostream>
+#include <algorithm>
+#include <atomic>
 
 // Platform-specific CPU affinity and priority settings
 #if defined(_WIN32)
@@ -86,20 +88,13 @@ inline ThreadPool::ThreadPool(size_t threads,
 	Priority priority)
 	: stop(false), cpu_affinity_(cpu_affinity), priority_(priority)
 {
+	// Reserve space to avoid reallocation
+	workers.reserve(threads);
+	
 	for (size_t i = 0; i < threads; ++i)
 	{
 		workers.emplace_back([this, i]
 			{
-				// Set CPU affinity (if configured)
-				if (!cpu_affinity_.empty())
-				{
-					int core = cpu_affinity_[i % cpu_affinity_.size()];
-					set_thread_affinity(workers[i], core);
-				}
-
-				// Set thread priority
-				set_thread_priority(workers[i], priority_);
-
 				for (;;)
 				{
 					std::function<void()> task;
@@ -116,6 +111,20 @@ inline ThreadPool::ThreadPool(size_t threads,
 				}
 			});
 	}
+	
+	// Set CPU affinity and priority after all threads are created
+	for (size_t i = 0; i < workers.size(); ++i)
+	{
+		// Set CPU affinity (if configured)
+		if (!cpu_affinity_.empty())
+		{
+			int core = cpu_affinity_[i % cpu_affinity_.size()];
+			set_thread_affinity(workers[i], core);
+		}
+		
+		// Set thread priority
+		set_thread_priority(workers[i], priority_);
+	}
 }
 
 // constructor (numerical priority)
@@ -124,20 +133,13 @@ inline ThreadPool::ThreadPool(size_t threads,
 	int custom_priority)
 	: stop(false), cpu_affinity_(cpu_affinity)
 {
+	// Reserve space to avoid reallocation
+	workers.reserve(threads);
+	
 	for (size_t i = 0; i < threads; ++i)
 	{
-		workers.emplace_back([this, i, custom_priority]
+		workers.emplace_back([this]
 			{
-				// Set CPU affinity (if configured)
-				if (!cpu_affinity_.empty())
-				{
-					int core = cpu_affinity_[i % cpu_affinity_.size()];
-					set_thread_affinity(workers[i], core);
-				}
-
-				// Set thread priority (numerical version)
-				set_thread_priority(workers[i], custom_priority);
-
 				for (;;)
 				{
 					std::function<void()> task;
@@ -154,6 +156,20 @@ inline ThreadPool::ThreadPool(size_t threads,
 				}
 			});
 	}
+	
+	// Set CPU affinity and priority after all threads are created
+	for (size_t i = 0; i < workers.size(); ++i)
+	{
+		// Set CPU affinity (if configured)
+		if (!cpu_affinity_.empty())
+		{
+			int core = cpu_affinity_[i % cpu_affinity_.size()];
+			set_thread_affinity(workers[i], core);
+		}
+		
+		// Set thread priority (numerical version)
+		set_thread_priority(workers[i], custom_priority);
+	}
 }
 
 // Wait for all tasks to complete (drain)
@@ -169,7 +185,7 @@ inline void ThreadPool::set_thread_affinity(std::thread& thread, int cpu_core)
 {
 #if defined(_WIN32) // Windows implementation
 	DWORD_PTR mask = static_cast<DWORD_PTR>(1) << cpu_core;
-	SetThreadAffinityMask(thread.native_handle(), mask);
+	SetThreadAffinityMask(reinterpret_cast<HANDLE>(thread.native_handle()), mask);
 #elif defined(__linux__) // Linux implementation
 	cpu_set_t cpuset;
 	CPU_ZERO(&cpuset);
@@ -191,7 +207,7 @@ inline void ThreadPool::set_thread_priority(std::thread& thread, Priority priori
 	case Priority::REALTIME: win_priority = THREAD_PRIORITY_TIME_CRITICAL; break;
 	default: win_priority = THREAD_PRIORITY_NORMAL;
 	}
-	SetThreadPriority(thread.native_handle(), win_priority);
+	SetThreadPriority(reinterpret_cast<HANDLE>(thread.native_handle()), win_priority);
 
 #elif defined(__linux__) // Linux implementation
 	int policy;
@@ -247,14 +263,23 @@ auto ThreadPool::enqueue(F&& f, Args&&... args)
 		if (stop)
 			throw std::runtime_error("enqueue on stopped ThreadPool");
 
-		// Decrease counter and notify after task execution
+		// Increase counter when enqueuing
+		task_count_++;
+		
+		// Wrap task to decrease counter and notify after execution
 		tasks.emplace([task, this]()
 			{
 				(*task)();
-				task_count_--;
-				task_done_cond_.notify_one();  // Notify drain() of task completion
+				// Decrease counter and notify in a thread-safe manner
+				{
+					std::unique_lock<std::mutex> lock(this->queue_mutex);
+					task_count_--;
+					if (task_count_ == 0)
+					{
+						task_done_cond_.notify_all();  // Notify all waiting drain() calls
+					}
+				}
 			});
-		task_count_++;  // Increase counter when enqueuing
 	}
 	condition.notify_one();
 	return res;
@@ -267,7 +292,7 @@ inline void ThreadPool::set_thread_priority(std::thread& thread, int custom_prio
 	// Windows priority range: THREAD_PRIORITY_LOWEST(-2) to THREAD_PRIORITY_TIME_CRITICAL(15)
 	if (custom_priority >= -2 && custom_priority <= 15)
 	{
-		SetThreadPriority(thread.native_handle(), custom_priority);
+		SetThreadPriority(reinterpret_cast<HANDLE>(thread.native_handle()), custom_priority);
 	}
 	else
 	{
